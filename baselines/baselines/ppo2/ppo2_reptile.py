@@ -13,7 +13,6 @@ except ImportError:
     MPI = None
 from baselines.ppo2.runner import Runner
 
-
 def constfn(val):
     def f(_):
         return val
@@ -172,10 +171,13 @@ def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2
                         slices = (arr[mbinds] for arr in (task_obs, task_returns, task_masks, task_actions, task_values, task_neglogpacs))
                         mblossvals.append(model.train(lrnow, cliprangenow, *slices))
                     new_vars.append([tf.identity(w) for w in weights])
+                    # reset weights
+                    for weight, phi in zip(weights, old_vars):
+                        tf.assign(weight, phi)
                     # update weights
-                    new_vars = average_vars(new_vars)
-                    for weight, phi, w in zip(weights, old_vars, new_vars):
-                        tf.assign(weight, phi + eps_reptile * (w - phi))
+                new_vars = average_vars(new_vars)
+                for weight, phi, w in zip(weights, old_vars, new_vars):
+                    tf.assign(weight, phi + eps_reptile * (w - phi))
 
 
         else: # recurrent version
