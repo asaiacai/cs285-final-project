@@ -53,7 +53,7 @@ def main():
         # Take more timesteps than we need to be sure that
         # we stop due to an exception.
         ppo2.learn(network='cnn',
-                   env=ShmemVecEnv(env_fns]),
+                   env=DummyVecEnv(env_fns),
                    nsteps=8192, 
                    nminibatches=8, 
                    lam=0.95,
