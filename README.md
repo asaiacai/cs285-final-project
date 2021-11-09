@@ -20,6 +20,7 @@ pip install -e "retro-contest/support[docker,rest]"
 
 # download game ROMS
 python -m retro.import.sega_classics
+```
 
 ## Joint Reptile training
 
