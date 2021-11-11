@@ -57,6 +57,7 @@ def main():
     env_fns = env_fns*process_per_env
     env_names = env_names*process_per_env
     os.environ['CUDA_VISIBLE_DEVICES'] = "0"[rank % 1]
+    print("rank = {}, env = {}".format(rank, env_names[rank]))
 
     with tf.Session(config=config):
         # Take more timesteps than we need to be sure that
