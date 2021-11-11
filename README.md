@@ -30,7 +30,7 @@ Edit `ppo2_reptile.py` with the desired hyperparameters/checkpoints. Run with
 python ppo2_reptile.py
 ```
 
-TODO: Test evaluation (Andrew)
+Edit `ppo2_eval.py` with desired hyperparameters/checkpoints to run evaluation in parallel
 
 ## Important Links
 

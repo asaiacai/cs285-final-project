@@ -9,8 +9,7 @@ import datetime
 
 from baselines.common.vec_env.dummy_vec_env import DummyVecEnv
 from baselines.common.vec_env.subproc_vec_env import SubprocVecEnv
-import baselines.ppo2.ppo2_eval as ppo2
-import baselines.ppo2.policies as policies
+import baselines.ppo2.ppo2 as ppo2
 
 from mpi4py import MPI
 import csv
@@ -25,7 +24,7 @@ from sacred.observers import FileStorageObserver, SlackObserver, RunObserver
 timestamp = datetime.datetime.now().strftime('%y%m%d%H%M%S')
 
 ex = Experiment()
-ex.observers.append(FileStorageObserver.create('./logs/ppo2_eval_'+timestamp))
+ex.observers.append(FileStorageObserver.create('./logs/ppo2_reptile_eval_'+timestamp))
 
 def create_eval_envs():
     env_fns = [] 
@@ -57,14 +56,14 @@ def main():
     process_per_env = int(MPI.COMM_WORLD.Get_size() / len(env_names))
     env_fns = env_fns*process_per_env
     env_names = env_names*process_per_env
-    os.environ['CUDA_VISIBLE_DEVICES'] = "123"[rank % 3]
+    os.environ['CUDA_VISIBLE_DEVICES'] = "0"[rank % 1]
 
     with tf.Session(config=config):
         # Take more timesteps than we need to be sure that
         # we stop due to an exception.
-        ppo2.learn(policy=policies.CnnPolicy,
+        ppo2.learn(network='cnn',
                    env=DummyVecEnv([env_fns[rank]]),
-                   nsteps=4096,
+                   nsteps=8912,
                    nminibatches=8,
                    lam=0.95,
                    gamma=0.99,
@@ -74,8 +73,7 @@ def main():
                    lr=lambda _: 2e-4,
                    cliprange=lambda _: 0.1,
                    total_timesteps=int(1e7),
-                   load_path='./checkpoints_joint_ppo2/01500', # Pretrained model
-                   num_games=num_games,
-                   game=env_names[rank])
+                   load_path='logs/reptile_4/checkpoints/00080', # Pretrained model
+        )
 
 
