@@ -202,7 +202,8 @@ def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2
             logger.logkv('eplenmean', safemean([epinfo['l'] for epinfo in epinfobuf]))
             logger.logkv('total_episodes', len(runner.eprew)) # Mean reward of last 100 episodes
             logger.logkv('total_episodes_per_game', len(runner.eprew)/nenvs) # Mean reward of last 100 episodes
-            logger.logkv('mean_ep_rewards', safemean(runner.eprew[-100:])) # Mean reward of last 100 episodes
+            logger.logkv('runnnig_ep_rewards', safemean(runner.eprew[-100:])) # Mean reward of last 100 episodes
+            logger.logkv('mean_ep_rewards', safemean(runner.eprew)) # Mean reward of last 100 episodes
             if len(runner.eprew):
                 logger.logkv('last_ep_rewards', runner.eprew[-1])
             else:
