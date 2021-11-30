@@ -1,27 +1,27 @@
-import os
 import time
 import numpy as np
+import tensorflow as tf
 import os.path as osp
 from baselines import logger
 from collections import deque
 from baselines.common import explained_variance, set_global_seeds
-from baselines.common.policies import build_policy
+from baselines.common.models import get_network_builder
+import random
 try:
     from mpi4py import MPI
 except ImportError:
     MPI = None
 from baselines.ppo2.runner import Runner
 
-
 def constfn(val):
     def f(_):
         return val
     return f
 
-def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2048, ent_coef=0.0, lr=3e-4,
-            vf_coef=0.5,  max_grad_norm=0.5, gamma=0.99, lam=0.95,
+def learn(*, network, env, total_timesteps, tasks=None, task_names=None, eval_env = None, seed=None, nsteps=2048, ent_coef=0.0, lr=3e-4,
+            vf_coef=0.5,  max_grad_norm=0.5, gamma=0.99, lam=0.95, maml_beta=0.1, task_batch=3,
             log_interval=10, nminibatches=4, noptepochs=4, cliprange=0.2,
-            save_interval=0, load_path=None, model_fn=None, update_fn=None, init_fn=None, mpi_rank_weight=1, comm=None, **network_kwargs):
+            save_interval=0, load_path=None, model_fn=None, **network_kwargs):
     '''
     Learn policy using PPO algorithm (https://arxiv.org/abs/1707.06347)
 
@@ -85,14 +85,20 @@ def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2
     else: assert callable(cliprange)
     total_timesteps = int(total_timesteps)
 
-    policy = build_policy(env, network, **network_kwargs)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=maml_beta)
 
     # Get the nb of env
     nenvs = env.num_envs
+    ntasks = len(tasks)
 
     # Get state_space and action_space
     ob_space = env.observation_space
     ac_space = env.action_space
+
+    if isinstance(network, str):
+        network_type = network
+        policy_network_fn = get_network_builder(network_type)(**network_kwargs)
+        network = policy_network_fn(ob_space.shape)
 
     # Calculate the batch_size
     nbatch = nenvs * nsteps
@@ -104,14 +110,17 @@ def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2
         from baselines.ppo2.model import Model
         model_fn = Model
 
-    model = model_fn(policy=policy, ob_space=ob_space, ac_space=ac_space, nbatch_act=nenvs, nbatch_train=nbatch_train,
-                    nsteps=nsteps, ent_coef=ent_coef, vf_coef=vf_coef,
-                    max_grad_norm=max_grad_norm, comm=comm, mpi_rank_weight=mpi_rank_weight)
+    model = model_fn(ac_space=ac_space, policy_network=network, ent_coef=ent_coef, vf_coef=vf_coef,
+                     max_grad_norm=max_grad_norm)
 
     if load_path is not None:
-        model.load(load_path)
+        load_path = osp.expanduser(load_path)
+        ckpt = tf.train.Checkpoint(model=model)
+        manager = tf.train.CheckpointManager(ckpt, load_path, max_to_keep=None)
+        ckpt.restore(manager.latest_checkpoint)
+
     # Instantiate the runner object
-    runner = Runner(env=env, model=model, nsteps=nsteps, gamma=gamma, lam=lam)
+    runners = [Runner(env=env, model=model, nsteps=nsteps, gamma=gamma, lam=lam, name=name) for env, name in zip(tasks, task_names)]
     if eval_env is not None:
         eval_runner = Runner(env = eval_env, model = model, nsteps = nsteps, gamma = gamma, lam= lam)
 
@@ -119,13 +128,10 @@ def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2
     if eval_env is not None:
         eval_epinfobuf = deque(maxlen=100)
 
-    if init_fn is not None:
-        init_fn()
-
     # Start total timer
     tfirststart = time.perf_counter()
-
-    nupdates = total_timesteps//nbatch
+    total_episodes = 0
+    nupdates = total_timesteps//nbatch//task_batch
     for update in range(1, nupdates+1):
         assert nbatch % nminibatches == 0
         # Start timer
@@ -133,100 +139,138 @@ def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2
         frac = 1.0 - (update - 1.0) / nupdates
         # Calculate the learning rate
         lrnow = lr(frac)
-        # Calculate the cliprange
         cliprangenow = cliprange(frac)
 
-        if update % log_interval == 0 and is_mpi_root: logger.info('Stepping environment...')
+        # this copies model parameters
+        old_params = [tf.Variable(x) for x in model.trainable_variables]
 
-        # Get minibatch
-        obs, returns, masks, actions, values, neglogpacs, states, epinfos = runner.run() #pylint: disable=E0632
-        if eval_env is not None:
-            eval_obs, eval_returns, eval_masks, eval_actions, eval_values, eval_neglogpacs, eval_states, eval_epinfos = eval_runner.run() #pylint: disable=E0632
+        # randomly select tasks
+        sampled_tasks = random.sample(range(ntasks), task_batch)
+        meta_grads = []
+        for i in sampled_tasks:
+            runner = runners[i]
 
-        if update % log_interval == 0 and is_mpi_root: logger.info('Done.')
+            if update % log_interval == 0 and is_mpi_root: logger.info('Stepping environment...')
 
-        epinfobuf.extend(epinfos)
-        if eval_env is not None:
-            eval_epinfobuf.extend(eval_epinfos)
+            # Get minibatch
+            with tf.GradientTape() as tape:
+                obs, returns, masks, actions, values, neglogpacs, states, epinfos = runner.run() #pylint: disable=E0632
+                if eval_env is not None:
+                    eval_obs, eval_returns, eval_masks, eval_actions, eval_values, eval_neglogpacs, eval_states, eval_epinfos = eval_runner.run() #pylint: disable=E0632
 
-        # Here what we're going to do is for each minibatch calculate the loss and append it.
-        mblossvals = []
-        if states is None: # nonrecurrent version
-            # Index of each element of batch_size
-            # Create the indices array
-            inds = np.arange(nbatch)
-            for _ in range(noptepochs):
-                # Randomize the indexes
-                np.random.shuffle(inds)
-                # 0 to batch_size with batch_train_size step
-                for start in range(0, nbatch, nbatch_train):
-                    end = start + nbatch_train
-                    mbinds = inds[start:end]
-                    slices = (arr[mbinds] for arr in (obs, returns, masks, actions, values, neglogpacs))
-                    mblossvals.append(model.train(lrnow, cliprangenow, *slices))
-        else: # recurrent version
-            assert nenvs % nminibatches == 0
-            envsperbatch = nenvs // nminibatches
-            envinds = np.arange(nenvs)
-            flatinds = np.arange(nenvs * nsteps).reshape(nenvs, nsteps)
-            for _ in range(noptepochs):
-                np.random.shuffle(envinds)
-                for start in range(0, nenvs, envsperbatch):
-                    end = start + envsperbatch
-                    mbenvinds = envinds[start:end]
-                    mbflatinds = flatinds[mbenvinds].ravel()
-                    slices = (arr[mbflatinds] for arr in (obs, returns, masks, actions, values, neglogpacs))
-                    mbstates = states[mbenvinds]
-                    mblossvals.append(model.train(lrnow, cliprangenow, *slices, mbstates))
+                epinfobuf.extend(epinfos)
+                if eval_env is not None:
+                    eval_epinfobuf.extend(eval_epinfos)
+
+                # Here what we're going to do is for each minibatch calculate the loss and append it.
+                mblossvals = []
+                # Index of each element of batch_size
+                # Create the indices array
+                inds = np.arange(nbatch)
+                for _ in range(noptepochs):
+                    np.random.shuffle(inds)
+                    # 0 to batch_size with batch_train_size step
+                    for start in range(0, nbatch, nbatch_train):
+                        end = start + nbatch_train
+                        mbinds = inds[start:end]
+                        slices = (tf.constant(arr[mbinds]) for arr in (obs, returns, masks, actions, values, neglogpacs))
+                        pg_loss, vf_loss, entropy, approxkl, clipfrac, loss = model.train(lrnow, cliprangenow, *slices)
+                        mblossvals.append([pg_loss, vf_loss, entropy, approxkl, clipfrac])
+
+                # collect some new trajectories with the updated policy but don't update policy
+                if update % log_interval == 0 and is_mpi_root: logger.info('Stepping environment with new policy...')
+                obs, returns, masks, actions, values, neglogpacs, states, epinfos = runner.run() #pylint: disable=E0632
+
+                # with tf.GradientTape() as tape:
+                losses = []
+                # with tf.GradientTape() as tape:
+                inds = np.arange(nbatch)
+                for _ in range(1):
+                    # Randomize the indexes
+                    np.random.shuffle(inds)
+                    for start in range(0, nbatch, nbatch_train):
+                        end = start + nbatch_train
+                        mbinds = inds[start:end]
+                        slices = (tf.constant(arr[mbinds]) for arr in (obs, returns, masks, actions, values, neglogpacs))
+                        losses.append(model.get_loss(cliprangenow, *slices))
+                
+                # reset model
+                meta_loss = tf.reduce_mean(losses)
+            meta_grads.append(tape.gradient(meta_loss, model.trainable_variables))
+            set_weights(model, old_params)
 
         # Feedforward --> get losses --> update
         lossvals = np.mean(mblossvals, axis=0)
+        meta_grad = mean(meta_grads)
+        meta_grad, _ = tf.clip_by_global_norm(meta_grad, 0.5)
+        # meta_grad = tape.gradient(meta_loss, model.trainable_variables)
+        grads_and_vars = zip(meta_grad, model.trainable_variables)
+        optimizer.apply_gradients(grads_and_vars)
+
         # End timer
         tnow = time.perf_counter()
         # Calculate the fps (frame per second)
-        fps = int(nbatch / (tnow - tstart))
-
-        if update_fn is not None:
-            update_fn(update)
-
+        fps = int(nbatch * task_batch / (tnow - tstart))
         if update % log_interval == 0 or update == 1:
             # Calculates if value function is a good predicator of the returns (ev > 1)
             # or if it's just worse than predicting nothing (ev =< 0)
+            total_rews = 0
+            episodes = 0
+            recent_eps = 0
             ev = explained_variance(values, returns)
             logger.logkv("misc/serial_timesteps", update*nsteps)
             logger.logkv("misc/nupdates", update)
-            logger.logkv("misc/total_timesteps", update*nbatch)
+            logger.logkv("misc/total_timesteps", update*nbatch*task_batch)
             logger.logkv("fps", fps)
             logger.logkv("misc/explained_variance", float(ev))
             logger.logkv('eprewmean', safemean([epinfo['r'] for epinfo in epinfobuf]))
             logger.logkv('eplenmean', safemean([epinfo['l'] for epinfo in epinfobuf]))
-            logger.logkv('total_episodes', len(runner.eprew)) # Mean reward of last 100 episodes
-            logger.logkv('total_episodes_per_game', len(runner.eprew)/nenvs) # Mean reward of last 100 episodes
-            logger.logkv('runnnig_ep_rewards', safemean(runner.eprew[-100:])) # Mean reward of last 100 episodes
-            logger.logkv('mean_ep_rewards', safemean(runner.eprew)) # Mean reward of last 100 episodes
+            for i in range(ntasks):
+                episodes += len(runners[i].eprew)
+                recent_rews = runners[i].eprew[-100:]
+                recent_eps += len(recent_rews)
+                total_rews += sum(recent_rews)
+            total_episodes += episodes
+            logger.logkv('total_episodes', total_episodes) # Total of all episodes thus far
+            logger.logkv('mean_ep_rewards', safediv(total_rews, recent_eps)) # Running average reward of last 100 episodes for the sampled tasks
+            logger.logkv('total_episodes_per_game', total_episodes/ntasks) # Mean reward of last 100 episodes
             if len(runner.eprew):
                 logger.logkv('last_ep_rewards', runner.eprew[-1])
             else:
                 logger.logkv('lasteprew', None)
+
             if eval_env is not None:
                 logger.logkv('eval_eprewmean', safemean([epinfo['r'] for epinfo in eval_epinfobuf]) )
                 logger.logkv('eval_eplenmean', safemean([epinfo['l'] for epinfo in eval_epinfobuf]) )
             logger.logkv('misc/time_elapsed', tnow - tfirststart)
             for (lossval, lossname) in zip(lossvals, model.loss_names):
                 logger.logkv('loss/' + lossname, lossval)
-
             logger.dumpkvs()
-        if save_interval and (update % save_interval == 0 or update == 1) and logger.get_dir() and is_mpi_root:
-            checkdir = osp.join(logger.get_dir(), 'checkpoints')
-            os.makedirs(checkdir, exist_ok=True)
-            savepath = osp.join(checkdir, '%.5i'%update)
-            print('Saving to', savepath)
-            model.save(savepath)
-
     return model
+
 # Avoid division error when calculate the mean (in our case if epinfo is empty returns np.nan, not return an error)
 def safemean(xs):
     return np.nan if len(xs) == 0 else np.mean(xs)
 
+def safediv(xs, denom):
+    return np.nan if denom == 0 else xs / denom
 
+def mean(var_list):
+    avg_vars = []
+    for vars in zip(*var_list):
+        avg_vars.append(tf.reduce_mean(vars, axis=0))
+    return avg_vars
 
+def add_vars(var_list):
+    avg_vars = []
+    for vars in zip(*var_list):
+        avg_vars.append(tf.reduce_sum(vars, axis=0))
+    return avg_vars
+
+def set_weights(model, var_list):
+    trainables = model.trainable_variables
+    for var, model_var in zip(var_list, trainables):
+        model_var.assign(var)
+
+def copy_params(model):
+    return [tf.Variable(x) for x in model.trainable_variables]
